@@ -5,7 +5,7 @@ import fs from 'fs'
 import { parse } from 'csv-parse/sync'
 import https from 'https'
 
-const EXPORT_AFTER_THIS_DATE = new Date('2025-06-04')
+const EXPORT_AFTER_THIS_DATE = new Date('2025-06-08')
 const EXPORT_FOLDER = '/Volumes/Backup/canvas'
 
 const { CANVAS_API_TOKEN, CANVAS_DOMAIN } = process.env
@@ -16,66 +16,39 @@ const wait = (ms) => {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-const fs = require('fs')
-const https = require('https')
-const url = require('url')
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 8 })
 
-function downloadLargeFile(fileUrl, filePath, token, maxRedirects = 5) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(filePath)
+async function downloadWithResume(url, filePath, retries = 5) {
+  const alreadyHave = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0
+  const headers = {
+    Authorization: `Bearer ${CANVAS_API_TOKEN}`,
+    Range: `bytes=${alreadyHave}-`,
+  }
 
-    function doRequest(currentUrl, redirectCount) {
-      const parsedUrl = new URL(currentUrl)
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await axios.get(url, {
+        responseType: 'stream',
+        headers,
+        httpsAgent,
+        timeout: 0,
+        maxRedirects: 5,
+      })
 
-      const options = {
-        hostname: parsedUrl.hostname,
-        path: parsedUrl.pathname + parsedUrl.search,
-        protocol: parsedUrl.protocol,
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+      if (![200, 206].includes(res.status)) {
+        throw new Error(`Unexpected status ${res.status}`)
       }
 
-      https
-        .get(options, (res) => {
-          if (
-            res.statusCode >= 300 &&
-            res.statusCode < 400 &&
-            res.headers.location
-          ) {
-            if (redirectCount >= maxRedirects) {
-              return reject(new Error('Too many redirects'))
-            }
+      await pipeline(res.data, fs.createWriteStream(filePath, { flags: 'a' }))
 
-            const nextUrl = new URL(res.headers.location, currentUrl).toString()
-            console.log(`Redirecting to: ${nextUrl}`)
-            return doRequest(nextUrl, redirectCount + 1)
-          }
-
-          if (res.statusCode !== 200) {
-            return reject(
-              new Error(`Request failed with status code ${res.statusCode}`)
-            )
-          }
-
-          res.pipe(file)
-
-          file.on('finish', () => {
-            file.close(() => {
-              console.log(`Download complete: ${filePath}`)
-              resolve(true)
-            })
-          })
-
-          file.on('error', (err) => {
-            fs.unlink(filePath, () => reject(err))
-          })
-        })
-        .on('error', reject)
+      return
+    } catch (err) {
+      if (attempt === retries) throw err
+      const delay = 2 ** attempt * 1_000
+      console.warn(`retrying in ${delay / 1000}s - ${err.message}`)
+      await new Promise((r) => setTimeout(r, delay))
     }
-
-    doRequest(fileUrl, 0)
-  })
+  }
 }
 
 const folderForCourse = (course) => {
@@ -181,7 +154,7 @@ const downloadFilesFromCourse = async (course) => {
     const folder = folderForCourse(course)
     const filePath = `${folder}/${fileName}`
 
-    return downloadLargeFile(fileUrl, filePath)
+    return downloadWithResume(fileUrl, filePath)
   }
 
   return false
