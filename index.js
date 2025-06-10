@@ -1,5 +1,6 @@
 import { config } from 'dotenv'
 config()
+import { pipeline } from 'stream/promises'
 import axios from 'axios'
 import fs from 'fs'
 import { parse } from 'csv-parse/sync'
