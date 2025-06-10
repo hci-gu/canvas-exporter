@@ -16,38 +16,65 @@ const wait = (ms) => {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function downloadLargeFile(fileUrl, filePath) {
+const fs = require('fs')
+const https = require('https')
+const url = require('url')
+
+function downloadLargeFile(fileUrl, filePath, token, maxRedirects = 5) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(filePath)
 
-    const options = {
-      headers: {
-        Authorization: `Bearer ${CANVAS_API_TOKEN}`,
-      },
-    }
+    function doRequest(currentUrl, redirectCount) {
+      const parsedUrl = new URL(currentUrl)
 
-    https
-      .get(fileUrl, options, (res) => {
-        if (res.statusCode !== 200) {
-          return reject(
-            new Error(`Request failed with status code ${res.statusCode}`)
-          )
-        }
+      const options = {
+        hostname: parsedUrl.hostname,
+        path: parsedUrl.pathname + parsedUrl.search,
+        protocol: parsedUrl.protocol,
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      }
 
-        res.pipe(file)
+      https
+        .get(options, (res) => {
+          if (
+            res.statusCode >= 300 &&
+            res.statusCode < 400 &&
+            res.headers.location
+          ) {
+            if (redirectCount >= maxRedirects) {
+              return reject(new Error('Too many redirects'))
+            }
 
-        file.on('finish', () => {
-          file.close(() => {
-            console.log(`Download complete: ${filePath}`)
-            resolve(true)
+            const nextUrl = new URL(res.headers.location, currentUrl).toString()
+            console.log(`Redirecting to: ${nextUrl}`)
+            return doRequest(nextUrl, redirectCount + 1)
+          }
+
+          if (res.statusCode !== 200) {
+            return reject(
+              new Error(`Request failed with status code ${res.statusCode}`)
+            )
+          }
+
+          res.pipe(file)
+
+          file.on('finish', () => {
+            file.close(() => {
+              console.log(`Download complete: ${filePath}`)
+              resolve(true)
+            })
+          })
+
+          file.on('error', (err) => {
+            fs.unlink(filePath, () => reject(err))
           })
         })
+        .on('error', reject)
+    }
 
-        file.on('error', (err) => {
-          fs.unlink(filePath, () => reject(err)) // Delete incomplete file
-        })
-      })
-      .on('error', reject)
+    doRequest(fileUrl, 0)
   })
 }
 
@@ -186,14 +213,14 @@ async function checkStatusAndDownload(courses) {
     console.log(`Processing course: ${course.name} (${course.id})`)
 
     await downloadFilesFromCourse(course)
-    await wait(500)
+    await wait(250)
   }
 
   if (allDone) {
     console.log('All courses have been processed. Exiting...')
     return
   }
-  await wait(5000)
+  await wait(1000)
   checkStatusAndDownload(courses)
 }
 
@@ -267,10 +294,8 @@ async function main() {
     })
 
     console.log(`Filtered courses to export: ${coursesToExport.length}`)
-    // first 10 courses
-    const tmpCourses = coursesToExport.slice(20, 30)
 
-    await checkStatusAndDownload(tmpCourses)
+    await checkStatusAndDownload(coursesToExport)
 
     // TODO: unpack and rename files
   } catch (error) {
