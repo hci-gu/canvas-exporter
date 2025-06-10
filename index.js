@@ -3,9 +3,10 @@ config()
 import axios from 'axios'
 import fs from 'fs'
 import { parse } from 'csv-parse/sync'
+import https from 'https'
 
 const EXPORT_AFTER_THIS_DATE = new Date('2025-06-04')
-const EXPORT_FOLDER = './out'
+const EXPORT_FOLDER = '/Volumes/Backup/canvas'
 
 const { CANVAS_API_TOKEN, CANVAS_DOMAIN } = process.env
 
@@ -15,13 +16,51 @@ const wait = (ms) => {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+function downloadLargeFile(fileUrl, filePath) {
+  return new Promise((resolve, reject) => {
+    const file = fs.createWriteStream(filePath)
+
+    const options = {
+      headers: {
+        Authorization: `Bearer ${CANVAS_API_TOKEN}`,
+      },
+    }
+
+    https
+      .get(fileUrl, options, (res) => {
+        if (res.statusCode !== 200) {
+          return reject(
+            new Error(`Request failed with status code ${res.statusCode}`)
+          )
+        }
+
+        res.pipe(file)
+
+        file.on('finish', () => {
+          file.close(() => {
+            console.log(`Download complete: ${filePath}`)
+            resolve(true)
+          })
+        })
+
+        file.on('error', (err) => {
+          fs.unlink(filePath, () => reject(err)) // Delete incomplete file
+        })
+      })
+      .on('error', reject)
+  })
+}
+
 const folderForCourse = (course) => {
   const startDateString = course.start_at || course.created_at
   const startDate = new Date(startDateString)
 
   const startYear = startDate.getFullYear()
 
-  const folder = `${EXPORT_FOLDER}/${startYear}/${course.name}`
+  // Sanitize course name by replacing unsafe characters
+  const sanitizedCourseName = course.name.replace(/[\/\\:*?"<>|]/g, '_')
+
+  const folder = `${EXPORT_FOLDER}/${startYear}/${sanitizedCourseName}`
 
   if (!fs.existsSync(folder)) {
     fs.mkdirSync(folder, { recursive: true })
@@ -115,27 +154,7 @@ const downloadFilesFromCourse = async (course) => {
     const folder = folderForCourse(course)
     const filePath = `${folder}/${fileName}`
 
-    const writer = fs.createWriteStream(filePath)
-
-    const response = await axios.get(fileUrl, {
-      headers: {
-        Authorization: `Bearer ${CANVAS_API_TOKEN}`,
-      },
-      responseType: 'stream',
-    })
-
-    response.data.pipe(writer)
-
-    return new Promise((resolve, reject) => {
-      writer.on('finish', () => {
-        console.log(`Export downloaded to ${filePath}`)
-        resolve(true)
-      })
-      writer.on('error', (err) => {
-        console.error(`Error downloading export: ${err.message}`)
-        reject(err)
-      })
-    })
+    return downloadLargeFile(fileUrl, filePath)
   }
 
   return false
