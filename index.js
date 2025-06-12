@@ -13,11 +13,54 @@ const { CANVAS_API_TOKEN, CANVAS_DOMAIN } = process.env
 
 const BASE_URL = `https://${CANVAS_DOMAIN}/api/v1`
 
-const wait = (ms) => {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+/* ------------------------------ Download queue ------------------------------ */
+
+const MAX_CONCURRENT_DOWNLOADS = 10
+let activeDownloads = 0
+const downloadQueue = []
+
+/**
+ * Schedule a download task so that no more than MAX_CONCURRENT_DOWNLOADS are
+ * running at the same time.
+ *
+ * @param {() => Promise<void>} taskFn  Function that performs the download
+ * @returns {Promise<void>}             Resolves when the download finishes
+ */
+function enqueueDownloadTask(taskFn) {
+  return new Promise((resolve, reject) => {
+    const execute = async () => {
+      try {
+        await taskFn()
+        resolve()
+      } catch (err) {
+        reject(err)
+      } finally {
+        activeDownloads--
+        if (downloadQueue.length > 0) {
+          const next = downloadQueue.shift()
+          activeDownloads++
+          next()
+        }
+      }
+    }
+
+    if (activeDownloads < MAX_CONCURRENT_DOWNLOADS) {
+      activeDownloads++
+      execute()
+    } else {
+      downloadQueue.push(execute)
+    }
+  })
 }
 
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 8 })
+/* --------------------------------------------------------------------------- */
+
+const httpsAgent = new https.Agent({
+  keepAlive: true,
+  maxSockets: MAX_CONCURRENT_DOWNLOADS,
+})
 
 async function downloadWithResume(url, filePath, retries = 5) {
   const alreadyHave = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0
@@ -47,7 +90,7 @@ async function downloadWithResume(url, filePath, retries = 5) {
       if (attempt === retries) throw err
       const delay = 2 ** attempt * 1_000
       console.warn(`retrying in ${delay / 1000}s - ${err.message}`)
-      await new Promise((r) => setTimeout(r, delay))
+      await wait(delay)
     }
   }
 }
@@ -55,14 +98,9 @@ async function downloadWithResume(url, filePath, retries = 5) {
 const folderForCourse = (course) => {
   const startDateString = course.start_at || course.created_at
   const startDate = new Date(startDateString)
-
   const startYear = startDate.getFullYear()
-
-  // Sanitize course name by replacing unsafe characters
   const sanitizedCourseName = course.name.replace(/[\/\\:*?"<>|]/g, '_')
-
   const folder = `${EXPORT_FOLDER}/${startYear}/${sanitizedCourseName}`
-
   if (!fs.existsSync(folder)) {
     fs.mkdirSync(folder, { recursive: true })
   }
@@ -90,25 +128,13 @@ const getActiveCourseExport = async (courseId) => {
       `Found ${activeExports.length} active exports for course ID ${courseId}`
     )
     if (activeExports.length === 0) {
-      console.log(`No active exports found for course ID ${courseId}`)
       return null
     }
-    // Sort by created_at in descending order to get the most recent export
+    // newest first
     activeExports.sort(
       (a, b) => new Date(b.created_at) - new Date(a.created_at)
     )
-    const activeExport = activeExports[0]
-
-    if (activeExport) {
-      console.log(
-        `Active export found for course ID ${courseId}:`,
-        activeExport
-      )
-      return activeExport
-    } else {
-      console.log(`No active export found for course ID ${courseId}`)
-      return null
-    }
+    return activeExports[0]
   } catch (error) {
     console.error(`Error fetching exports for course ID ${courseId}:`, error)
     return null
@@ -130,7 +156,7 @@ const createCourseExport = async (courseId) => {
         },
       }
     )
-    console.log(`Export created for course ID ${courseId}:`, response.data)
+    console.log(`Export created for course ID ${courseId}`)
     return response.data
   } catch (error) {
     console.error(`Error creating export for course ID ${courseId}:`, error)
@@ -146,56 +172,74 @@ const downloadFilesFromCourse = async (course) => {
       `No active export found for course ID ${course.id}. Creating a new export...`
     )
     await createCourseExport(course.id)
-    return false
+    return null
   }
 
-  if (activeExport.workflow_state == 'exported' && activeExport.attachment) {
+  if (activeExport.workflow_state === 'exported' && activeExport.attachment) {
     const fileUrl = activeExport.attachment.url
     const fileName = activeExport.attachment.filename
     const folder = folderForCourse(course)
     const filePath = `${folder}/${fileName}`
 
-    return downloadWithResume(fileUrl, filePath)
+    // Use the download queue
+    return enqueueDownloadTask(() => downloadWithResume(fileUrl, filePath))
   }
 
-  return false
+  return null
 }
 
 const checkIfCourseFileExported = async (course) => {
   const folder = folderForCourse(course)
-
-  // check if any *.imscc file exists in the folder
-  const files = fs.readdirSync(folder)
-  for (const file of files) {
-    if (file.endsWith('.imscc')) {
-      return true
-    }
-  }
-
-  return false
+  return (
+    fs.existsSync(folder) &&
+    fs.readdirSync(folder).some((f) => f.endsWith('.imscc'))
+  )
 }
 
 async function checkStatusAndDownload(courses) {
-  let allDone = true
+  let pendingCourses = courses
 
-  for (const course of courses) {
-    if (await checkIfCourseFileExported(course)) {
-      console.log(`Course "${course.name}" already exported. Skipping...`)
-      continue
+  while (true) {
+    const downloadPromises = []
+
+    const stillPending = []
+
+    for (const course of pendingCourses) {
+      if (await checkIfCourseFileExported(course)) {
+        console.log(`Course "${course.name}" already exported. Skipping...`)
+        continue
+      }
+
+      console.log(`Processing course: ${course.name} (${course.id})`)
+      const downloadPromise = await downloadFilesFromCourse(course)
+      if (downloadPromise) {
+        // Already exported and enqueued for download
+        downloadPromises.push(downloadPromise)
+      } else {
+        // Export is being created, check again later
+        stillPending.push(course)
+      }
+      await wait(250)
     }
-    allDone = false
-    console.log(`Processing course: ${course.name} (${course.id})`)
 
-    await downloadFilesFromCourse(course)
-    await wait(250)
-  }
+    // Wait for all downloads that have been enqueued in this cycle
+    if (downloadPromises.length) {
+      await Promise.all(downloadPromises)
+    }
 
-  if (allDone) {
-    console.log('All courses have been processed. Exiting...')
-    return
+    // If there are no more pending courses, we're done
+    if (stillPending.length === 0) {
+      console.log('All courses have been processed. Exiting...')
+      return
+    }
+
+    // Otherwise, wait before checking again
+    pendingCourses = stillPending
+    console.log(
+      `Waiting for ${pendingCourses.length} export(s) to finish before retrying...`
+    )
+    await wait(30_000)
   }
-  await wait(1000)
-  checkStatusAndDownload(courses)
 }
 
 const getAllCourses = async (
@@ -203,12 +247,9 @@ const getAllCourses = async (
   allCourses = []
 ) => {
   if (allCourses.length === 0) {
-    const cachedCourses = fs.existsSync(`${EXPORT_FOLDER}/courses.json`)
-    if (cachedCourses) {
-      const cachedData = fs.readFileSync(
-        `${EXPORT_FOLDER}/courses.json`,
-        'utf-8'
-      )
+    const cachedPath = `${EXPORT_FOLDER}/courses.json`
+    if (fs.existsSync(cachedPath)) {
+      const cachedData = fs.readFileSync(cachedPath, 'utf-8')
       allCourses = JSON.parse(cachedData)
       console.log(`Loaded ${allCourses.length} courses from cache.`)
       return allCourses
@@ -220,11 +261,12 @@ const getAllCourses = async (
       Authorization: `Bearer ${CANVAS_API_TOKEN}`,
     },
   })
-  const courses = response.data
 
+  const courses = response.data
   if (courses.length === 0) {
     return allCourses
   }
+
   const nextPage = response.headers.link
     ? response.headers.link.match(/<([^>]+)>;\s*rel="next"/)
     : null
@@ -237,7 +279,7 @@ const getAllCourses = async (
 
   console.log(`Fetched ${courses.length} courses. Total: ${allCourses.length}`)
 
-  return getAllCourses(nextPage ? nextPage[1] : null, allCourses)
+  return nextPage ? getAllCourses(nextPage[1], allCourses) : allCourses
 }
 
 async function main() {
@@ -251,19 +293,14 @@ async function main() {
       skip_empty_lines: true,
       delimiter: ';',
     })
-    // console.log(parsedCsv)
+
     const matchedCourses = courses.filter((course) => {
       const courseCode = course.name.split(' ')[0]
-      // does courseCode starat with TIA or TIG
-      // if (courseCode.startsWith('TIA') || courseCode.startsWith('TIG')) {
-      //   console.log(`Checking course code: ${courseCode}`)
-      // }
       return parsedCsv.some((row) => row.kod === courseCode)
     })
-    console.log(matchedCourses.length)
+
     const coursesToExport = matchedCourses.filter((course) => {
       const startDate = new Date(course.start_at || course.created_at)
-      // is after 1st January 2021
       return startDate >= new Date('2021-01-01')
     })
 
